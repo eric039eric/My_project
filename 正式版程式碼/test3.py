@@ -4,7 +4,7 @@ import socket
 import time
 
 # ================= 網路設定 =================
-ESP_IP = "192.168.137.72"   # 改成 ESP32 序列埠顯示的 IP
+ESP_IP = "192.168.137.188"   # 改成 ESP32 序列埠顯示的 IP
 ESP_PORT = 8888
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 

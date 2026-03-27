@@ -26,13 +26,13 @@ const int GRIP_OPEN = 110;
 const int GRIP_CLOSE = 70;
 
 // 抓取姿態
-const int PICK_DOWN_M2 = 45;
-const int PICK_DOWN_M3 = 125;
+const int PICK_DOWN_M2 = 110;
+const int PICK_DOWN_M3 = 80;
 const int PICK_UP_M2 = 85;
 const int PICK_UP_M3 = 95;
 
 // 放置姿態
-const int PLACE_DOWN_M2 = 105;
+const int PLACE_DOWN_M2 = 80;
 const int PLACE_DOWN_M3 = 70;
 
 // 顏色放置區底座角度
