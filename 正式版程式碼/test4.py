@@ -1,271 +1,438 @@
-import cv2  # type: ignore # 匯入 OpenCV，用來開啟攝影機、做影像處理、畫畫面提示
-import numpy as np  # type: ignore # 匯入 NumPy，用來建立 HSV 顏色範圍陣列與做一些數值運算
-import socket  # 匯入 socket，讓 Python 可以透過 UDP 傳送指令給 ESP32
-import time  # 匯入 time，讓程式可以記錄時間與等待夾取完成
+import cv2          # type: ignore # 匯入 OpenCV 函式庫，用於影像擷取與處理
+import numpy as np  # type: ignore # 匯入 NumPy，用於建立 HSV 顏色範圍陣列
+import socket       # 匯入 socket，用於建立 Python 端 UDP 通訊介面
+import time         # 匯入 time，用於計算夾取等待時間
 
-ESP_IP = "192.168.137.196"  # 設定 ESP32 的 IP 位址，這裡要改成你自己 ESP32 實際連線後顯示的 IP
-ESP_PORT = 8888  # 設定 ESP32 接收 UDP 指令的 Port
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # 建立一個 UDP socket，之後所有文字命令都由它送出
+# =========================================================
+# ESP32 網路設定
+# =========================================================
+ESP_IP   = "192.168.137.50"  # ESP32 固定 IP 位址，需與 Arduino 程式中設定的 local_ip 完全一致
+ESP_PORT = 8888               # ESP32 UDP 監聽的 Port 號碼，需與 Arduino 的 localPort 一致
+SOCKET_TIMEOUT = 0.2          # UDP socket 接收逾時秒數（此程式主要送出命令，非接收用）
 
-CAMERA_INDEX = 1  # 設定要使用哪一台攝影機，如果你的電腦只有一台鏡頭可試 0
-cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # 用 DirectShow 模式開啟攝影機，Windows 上通常比較穩定
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # 建立 UDP socket 物件
+sock.settimeout(SOCKET_TIMEOUT)                          # 設定 socket 逾時時間
 
-AUTO_RUN = True  # 設定是否啟用全自動模式，True 代表辨識成功後會自動送出夾取指令
-LOCK_FRAMES = 12  # 設定目標必須連續穩定幾幀才會觸發夾取，避免誤判
-PICK_WAIT_SECONDS = 4.5  # 設定送出 PICK 指令後等待幾秒，讓手臂有時間完成整個夾取流程
-CLEAR_FRAMES_REQUIRED = 8  # 設定完成一輪後，十字區域必須連續空白幾幀，才允許下一次夾取
-MIN_RADIUS = 12  # 設定最小包圍圓半徑，小於此值的區塊通常視為雜訊
-MIN_AREA = 250  # 設定最小輪廓面積，小於此值的顏色區塊通常視為雜訊
-TARGET_ZONE_HALF_W = 35  # 設定中心夾取區的一半寬度，物體中心在這範圍內才算放在十字點位附近
-TARGET_ZONE_HALF_H = 35  # 設定中心夾取區的一半高度，物體中心在這範圍內才算放在十字點位附近
-TARGET_STABLE_DIST = 18  # 設定兩幀之間若目標位移小於這個像素值，就視為同一個穩定目標
+# =========================================================
+# 攝影機設定
+# =========================================================
+CAMERA_INDEX = 1  # 攝影機編號，0 為預設內建攝影機，1 為外接 USB 攝影機
+cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)  # 開啟攝影機，Windows 下使用 DirectShow 後端
 
-lower_red1 = np.array([0, 120, 70])  # 設定紅色第一段 HSV 下界，因為紅色會跨越 HSV 的起點
-upper_red1 = np.array([10, 255, 255])  # 設定紅色第一段 HSV 上界
-lower_red2 = np.array([170, 120, 70])  # 設定紅色第二段 HSV 下界，用來補另一側紅色範圍
-upper_red2 = np.array([180, 255, 255])  # 設定紅色第二段 HSV 上界
-lower_green = np.array([40, 50, 50])  # 設定綠色 HSV 下界
-upper_green = np.array([80, 255, 255])  # 設定綠色 HSV 上界
-lower_blue = np.array([100, 50, 50])  # 設定藍色 HSV 下界
-upper_blue = np.array([130, 255, 255])  # 設定藍色 HSV 上界
+# =========================================================
+# 系統控制參數
+# =========================================================
+AUTO_RUN             = True  # 自動夾取模式開關，True 時偵測到穩定目標會自動送出 PICK 命令
+LOCK_FRAMES          = 12    # 穩定幀數門檻，目標需在夾取區內連續穩定多少幀才觸發夾取
+PICK_WAIT_SECONDS    = 4.5   # 送出 PICK 命令後等待手臂完成動作的秒數
+CLEAR_FRAMES_REQUIRED = 8    # 夾取完成後夾取區需連續多少幀無目標才允許下一次夾取
 
-state = "SEARCH"  # 建立狀態機初始狀態，SEARCH 代表正在等待物體出現在中心區
-stable_count = 0  # 建立穩定幀數計數器，一開始先設為 0
-pick_start_time = 0.0  # 建立夾取開始時間變數，一開始先設為 0
-last_cmd = "-"  # 建立最後送出命令的顯示字串，初始先顯示 -
-last_target = None  # 建立上一幀目標資訊，用來判斷目前是不是同一個穩定目標
-clear_count = 0  # 建立清空幀數計數器，用來確認夾取後十字範圍已經真的沒有物體
+MIN_RADIUS = 12   # 有效目標的最小包圍圓半徑（像素），低於此值視為雜訊
+MIN_AREA   = 250  # 有效目標的最小輪廓面積（像素平方），低於此值視為雜訊
 
-print(f"ESP32 IP: {ESP_IP}")  # 在終端機印出目前要連線的 ESP32 IP，方便檢查
-print("固定十字點位單次自動辨色夾取版")  # 印出目前版本名稱，提醒這一版是一物一抓版本
-print("快捷鍵:")  # 印出操作說明標題
-print(" q = 離開程式")  # 提示按 q 可以結束程式
-print(" s = 切換 AUTO_RUN")  # 提示按 s 可以切換自動模式開或關
-print(" h = HOME")  # 提示按 h 可以要求手臂回 HOME
-print(" o = OPEN")  # 提示按 o 可以打開夾爪
-print(" c = CLOSE")  # 提示按 c 可以關閉夾爪
-print(" u = STATUS")  # 提示按 u 可以要求 ESP32 回報狀態
-print(" r / g / b = 手動測試顏色夾取")  # 提示按 r、g、b 可以直接測試指定顏色夾取
-print(f"啟動狀態: AUTO_RUN={AUTO_RUN}")  # 印出程式啟動時自動模式的狀態
+TARGET_ZONE_HALF_W = 35  # 固定夾取區的水平半寬（像素），中心點左右各 35 像素
+TARGET_ZONE_HALF_H = 35  # 固定夾取區的垂直半高（像素），中心點上下各 35 像素
+TARGET_STABLE_DIST = 18  # 連續兩幀同一目標的位置容許偏移距離（像素），超過此值視為不穩定
 
+# =========================================================
+# HSV 顏色辨識範圍設定
+# =========================================================
+# 紅色在 HSV 色環中橫跨 0° 與 180° 兩端，因此需要兩組範圍合併
+lower_red1 = np.array([0,   120,  70])   # 紅色範圍一下限（低色相端）
+upper_red1 = np.array([10,  255, 255])   # 紅色範圍一上限
 
-def send_cmd(cmd: str):  # 定義 send_cmd 函式，負責統一送出 UDP 指令到 ESP32
-    global last_cmd  # 宣告要修改全域變數 last_cmd
-    sock.sendto(cmd.encode("utf-8"), (ESP_IP, ESP_PORT))  # 把文字命令轉成 UTF-8 後透過 UDP 傳給 ESP32
-    last_cmd = cmd  # 把本次送出的命令記錄起來，方便顯示在畫面上
-    print("SEND ->", cmd)  # 在終端機印出送出的命令，方便除錯與展示
+lower_red2 = np.array([170, 120,  70])   # 紅色範圍二下限（高色相端）
+upper_red2 = np.array([180, 255, 255])   # 紅色範圍二上限
 
+lower_green = np.array([40,  50,  50])   # 綠色 HSV 範圍下限
+upper_green = np.array([80,  255, 255])  # 綠色 HSV 範圍上限
 
+lower_blue  = np.array([100,  50,  50])  # 藍色 HSV 範圍下限
+upper_blue  = np.array([130, 255, 255])  # 藍色 HSV 範圍上限
 
-def preprocess_mask(mask):  # 定義遮罩前處理函式，讓顏色區塊更乾淨
-    mask = cv2.erode(mask, None, iterations=2)  # 先做侵蝕，去掉小雜點
-    mask = cv2.dilate(mask, None, iterations=2)  # 再做膨脹，把真正目標補回來
-    return mask  # 回傳處理後的遮罩
+# =========================================================
+# 狀態機全域變數
+# =========================================================
+state           = "SEARCH"  # 目前系統狀態，初始為搜尋模式（SEARCH / WAIT_PICK / WAIT_CLEAR）
+stable_count    = 0         # 目標在夾取區內的連續穩定幀數計數器
+pick_start_time = 0.0       # 記錄送出 PICK 命令的時間點，用於計算等待倒數
+last_cmd        = "-"       # 記錄最後送出的命令字串，顯示於畫面上供除錯用
+last_target     = None      # 記錄上一幀偵測到的目標資訊，用於穩定性比較
+clear_count     = 0         # 夾取區連續無目標的幀數計數器
 
-
-
-def find_target(mask, frame, color_name, draw_color):  # 定義找單一顏色目標的函式
-    mask = preprocess_mask(mask)  # 先把遮罩做基本去雜訊處理
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  # 找出遮罩中的外部輪廓
-
-    if len(contours) == 0:  # 如果完全沒有輪廓
-        return None  # 直接回傳 None，代表沒有找到這個顏色的物體
-
-    c = max(contours, key=cv2.contourArea)  # 從所有輪廓中選出面積最大的那一個
-    area = cv2.contourArea(c)  # 計算這個最大輪廓的面積
-    if area < MIN_AREA:  # 如果輪廓面積小於門檻
-        return None  # 視為雜訊，不當成有效目標
-
-    (center, radius) = cv2.minEnclosingCircle(c)  # 找出能包住該輪廓的最小外接圓
-    cx, cy = center  # 把圓心座標拆成 cx 與 cy
-    if radius < MIN_RADIUS:  # 如果圓半徑小於門檻
-        return None  # 視為雜訊，不當成有效目標
-
-    cv2.circle(frame, (int(cx), int(cy)), int(radius), draw_color, 2)  # 在畫面上畫出該物體的外接圓
-    cv2.putText(frame, f"{color_name}", (int(cx) - 20, int(cy) - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, draw_color, 2)  # 在物體旁邊寫上辨識到的顏色名稱
-
-    return {  # 用字典格式回傳這個目標的重要資訊
-        "color": color_name,  # 回傳目標顏色名稱
-        "cx": int(cx),  # 回傳目標中心 x 座標
-        "cy": int(cy),  # 回傳目標中心 y 座標
-        "radius": float(radius),  # 回傳目標外接圓半徑
-        "area": float(area),  # 回傳目標輪廓面積
-    }  # 結束字典回傳
+# =========================================================
+# 啟動資訊顯示
+# =========================================================
+print("=" * 60)
+print("ESP32 固定 IP 對應版：Fixed Cross Auto Color Pick")
+print(f"ESP32 IP  : {ESP_IP}")      # 顯示目前設定的 ESP32 IP
+print(f"ESP32 PORT: {ESP_PORT}")    # 顯示通訊 Port
+print(f"CAMERA IDX: {CAMERA_INDEX}")  # 顯示攝影機編號
+print(f"AUTO_RUN  : {AUTO_RUN}")    # 顯示自動模式狀態
+print("=" * 60)
+print("快捷鍵:")
+print("  q       = 離開程式")
+print("  s       = 切換 AUTO_RUN")
+print("  h       = HOME（手臂回原點）")
+print("  o       = OPEN（夾爪打開）")
+print("  c       = CLOSE（夾爪關閉）")
+print("  u       = STATUS（查詢 ESP32 狀態）")
+print("  p       = PING（測試 ESP32 是否在線）")
+print("  r/g/b   = 手動觸發紅/綠/藍夾取")
+print("  1/2/3/4 = 手動測試單顆伺服馬達回原點")
+print("  z/x     = Base 馬達（M1）左右微調")
+print("=" * 60)
 
 
+# =========================================================
+# 函式定義
+# =========================================================
 
-def choose_target(targets, center_x, center_y):  # 定義挑選目標函式，當多種顏色同時存在時選一個最適合的
-    valid = [t for t in targets if t is not None]  # 先把非 None 的有效目標挑出來
-    if not valid:  # 如果完全沒有有效目標
-        return None  # 回傳 None
-
-    def score(t):  # 定義一個內部評分函式
-        dist = abs(t["cx"] - center_x) + abs(t["cy"] - center_y)  # 計算目標到畫面中心的距離
-        area_bonus = t["area"] * 0.002  # 給面積大的目標一些加分，代表較穩定易辨識
-        return dist - area_bonus  # 距離越小越好、面積越大越好，所以回傳距離減去面積加分
-
-    return min(valid, key=score)  # 從有效目標中選出分數最低的那個當成主要目標
-
-
-
-def update_stable_count(target):  # 定義穩定計數函式，用來避免目標抖動時誤觸發
-    global stable_count  # 宣告會修改全域變數 stable_count
-    global last_target  # 宣告會修改全域變數 last_target
-
-    if target is None:  # 如果目前沒有目標
-        stable_count = 0  # 把穩定計數歸零
-        last_target = None  # 把上一幀目標清空
-        return  # 直接離開函式
-
-    if last_target is None:  # 如果上一幀還沒有目標
-        stable_count = 1  # 代表從第 1 幀開始累計
-    else:  # 如果上一幀有目標
-        same_color = target["color"] == last_target["color"]  # 判斷這一幀與上一幀顏色是否相同
-        close_enough = abs(target["cx"] - last_target["cx"]) <= TARGET_STABLE_DIST and abs(target["cy"] - last_target["cy"]) <= TARGET_STABLE_DIST  # 判斷兩幀之間位置是否足夠接近
-        if same_color and close_enough:  # 如果顏色相同而且位置差距也不大
-            stable_count += 1  # 把穩定計數加一
-        else:  # 如果顏色變了或位置跳太多
-            stable_count = 1  # 把這一幀當成新目標重新開始計數
-
-    last_target = {"color": target["color"], "cx": target["cx"], "cy": target["cy"]}  # 把這一幀的目標記下來給下一幀比較
+def send_cmd(cmd: str):
+    """透過 UDP 將控制命令字串傳送至 ESP32"""
+    global last_cmd
+    try:
+        sock.sendto(cmd.encode("utf-8"), (ESP_IP, ESP_PORT))  # 將命令編碼為 UTF-8 並送出
+        last_cmd = cmd                                         # 更新最後送出命令紀錄
+        print("SEND ->", cmd)                                  # 在 terminal 顯示送出的命令
+    except Exception as e:
+        print(f"SEND FAILED -> {cmd} | {e}")                  # 若傳送失敗則顯示錯誤訊息
 
 
-
-def is_target_in_pick_zone(target, center_x, center_y):  # 定義判斷函式，用來檢查目前目標是否在十字中心夾取區內
-    if target is None:  # 如果沒有目標
-        return False  # 直接回傳 False
-    error_x = target["cx"] - center_x  # 計算目標在 x 方向相對中心的誤差
-    error_y = target["cy"] - center_y  # 計算目標在 y 方向相對中心的誤差
-    return abs(error_x) <= TARGET_ZONE_HALF_W and abs(error_y) <= TARGET_ZONE_HALF_H  # 只有 x 與 y 都在容許範圍內才算在夾取區中
+def preprocess_mask(mask):
+    """對遮罩進行形態學處理，去除雜訊並強化目標輪廓"""
+    mask = cv2.erode(mask,  None, iterations=2)   # 侵蝕：消除遮罩中的小型雜訊點
+    mask = cv2.dilate(mask, None, iterations=2)   # 膨脹：恢復目標輪廓面積，補回被侵蝕的邊緣
+    return mask
 
 
-while True:  # 進入主迴圈，讓程式持續讀取攝影機影像並做辨識
-    ret, frame = cap.read()  # 從攝影機讀取一張畫面
-    if not ret:  # 如果讀不到畫面
-        print("讀不到攝影機畫面，程式結束。")  # 印出錯誤訊息
-        break  # 跳出主迴圈
+def find_target(mask, frame, color_name, draw_color):
+    """
+    在指定顏色遮罩中尋找最大有效輪廓，
+    若符合最小半徑與面積條件則回傳目標資訊字典，否則回傳 None
+    """
+    mask = preprocess_mask(mask)  # 先對遮罩做形態學處理
 
-    h, w, _ = frame.shape  # 取得畫面的高與寬
-    center_x = w // 2  # 計算畫面中心的 x 座標
-    center_y = h // 2  # 計算畫面中心的 y 座標
+    # 在遮罩中搜尋所有外部輪廓
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    cv2.line(frame, (center_x, 0), (center_x, h), (255, 255, 255), 1)  # 在畫面上畫垂直中心線，形成十字準線的一部分
-    cv2.line(frame, (0, center_y), (w, center_y), (255, 255, 255), 1)  # 在畫面上畫水平中心線，形成十字準線的一部分
+    if len(contours) == 0:   # 若沒有找到任何輪廓則直接回傳 None
+        return None
 
-    box_left = center_x - TARGET_ZONE_HALF_W  # 計算中心夾取框的左邊界
-    box_right = center_x + TARGET_ZONE_HALF_W  # 計算中心夾取框的右邊界
-    box_top = center_y - TARGET_ZONE_HALF_H  # 計算中心夾取框的上邊界
-    box_bottom = center_y + TARGET_ZONE_HALF_H  # 計算中心夾取框的下邊界
-    cv2.rectangle(frame, (box_left, box_top), (box_right, box_bottom), (0, 255, 255), 2)  # 在畫面中心畫出固定夾取區
-    cv2.putText(frame, "FIXED PICK ZONE", (box_left - 10, box_top - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)  # 在夾取框上方標示這是固定夾取區
+    c    = max(contours, key=cv2.contourArea)  # 取面積最大的輪廓作為候選目標
+    area = cv2.contourArea(c)                  # 計算該輪廓的像素面積
 
-    blurred = cv2.GaussianBlur(frame, (11, 11), 0)  # 對畫面做高斯模糊，降低雜訊與小反光造成的干擾
-    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)  # 把 BGR 畫面轉成 HSV 色彩空間，方便用顏色範圍做辨識
+    if area < MIN_AREA:   # 若面積小於最小門檻則視為雜訊，回傳 None
+        return None
 
-    mask_r = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)  # 建立紅色遮罩，因為紅色分兩段所以要相加
-    mask_g = cv2.inRange(hsv, lower_green, upper_green)  # 建立綠色遮罩
-    mask_b = cv2.inRange(hsv, lower_blue, upper_blue)  # 建立藍色遮罩
+    (center, radius) = cv2.minEnclosingCircle(c)  # 計算輪廓的最小包圍圓，取得圓心與半徑
+    cx, cy = center                               # 解包圓心座標
 
-    target_r = find_target(mask_r, frame, "RED", (0, 0, 255))  # 尋找紅色目標並在畫面上標記
-    target_g = find_target(mask_g, frame, "GREEN", (0, 255, 0))  # 尋找綠色目標並在畫面上標記
-    target_b = find_target(mask_b, frame, "BLUE", (255, 0, 0))  # 尋找藍色目標並在畫面上標記
-    target = choose_target([target_r, target_g, target_b], center_x, center_y)  # 從找到的所有顏色目標中選出主要目標
+    if radius < MIN_RADIUS:   # 若半徑小於最小門檻則視為雜訊，回傳 None
+        return None
 
-    status_msg = "SEARCH"  # 預設狀態文字為 SEARCH
-    color_msg = "-"  # 預設顯示的顏色文字為 -
-    zone_msg = "OUT"  # 預設顯示物體不在中心夾取區
-    in_pick_zone = is_target_in_pick_zone(target, center_x, center_y)  # 先計算本幀目標是否在固定夾取區內
+    # 在畫面上繪製目標的包圍圓
+    cv2.circle(frame, (int(cx), int(cy)), int(radius), draw_color, 2)
 
-    if target is not None:  # 如果有找到目標
-        color_msg = target["color"]  # 顯示目前辨識到的顏色
-    zone_msg = "IN" if in_pick_zone else "OUT"  # 更新區域狀態顯示
+    # 在目標圓心附近標註顏色名稱
+    cv2.putText(
+        frame, color_name,
+        (int(cx) - 20, int(cy) - 18),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, draw_color, 2,
+    )
 
-    if state == "WAIT_PICK":  # 如果目前狀態是等待夾取完成
-        remain = PICK_WAIT_SECONDS - (time.time() - pick_start_time)  # 計算還要等待幾秒
-        if remain <= 0:  # 如果等待時間已經結束
-            state = "WAIT_CLEAR"  # 切換到等待清空狀態，要求中心區必須先空掉
-            clear_count = 0  # 清空區域計數從 0 開始重新累積
-            stable_count = 0  # 清除穩定計數
-            last_target = None  # 清除上一幀目標
-        else:  # 如果還在等待時間內
-            status_msg = f"WAIT_PICK {remain:.1f}s"  # 顯示還剩多少秒
+    # 回傳目標資訊字典，供後續判斷與選擇使用
+    return {
+        "color" : color_name,       # 目標顏色名稱（RED / GREEN / BLUE）
+        "cx"    : int(cx),          # 目標圓心 X 座標（像素）
+        "cy"    : int(cy),          # 目標圓心 Y 座標（像素）
+        "radius": float(radius),    # 目標包圍圓半徑
+        "area"  : float(area),      # 目標輪廓面積
+    }
 
-    if state == "WAIT_CLEAR":  # 如果目前狀態是等待中心區物體被移除
-        if in_pick_zone:  # 如果中心區內還有物體存在
-            clear_count = 0  # 空白計數歸零，表示還不能重新允許下一次夾取
-            status_msg = "WAIT_REMOVE_OBJECT"  # 提示必須先把目前物體移開
-        else:  # 如果中心區已經沒有物體
-            clear_count += 1  # 空白計數加一
-            status_msg = f"WAIT_CLEAR {clear_count}/{CLEAR_FRAMES_REQUIRED}"  # 顯示還需要再空幾幀
-            if clear_count >= CLEAR_FRAMES_REQUIRED:  # 如果已經連續空白足夠多幀
-                state = "SEARCH"  # 重新回到 SEARCH 狀態，準備接受下一個新物體
-                clear_count = 0  # 清空空白計數
-                stable_count = 0  # 清空穩定計數
-                last_target = None  # 清空上一幀目標
-                status_msg = "READY_NEXT_OBJECT"  # 顯示已準備好接受下一個物體
 
-    if state == "SEARCH":  # 如果目前狀態是 SEARCH
-        if target is None:  # 如果目前沒有找到任何有效目標
-            stable_count = 0  # 穩定計數歸零
-            last_target = None  # 把上一幀目標清空
-            status_msg = "SEARCH -> No target"  # 顯示沒有找到目標
-        else:  # 如果有找到有效目標
-            if in_pick_zone:  # 如果物體在固定夾取區內
-                update_stable_count(target)  # 更新穩定計數
-                status_msg = f"LOCKING {stable_count}/{LOCK_FRAMES}"  # 顯示正在鎖定第幾幀
-                cv2.circle(frame, (target["cx"], target["cy"]), 6, (0, 255, 255), -1)  # 在物體中心畫一個實心點，表示已進入夾取區
-            else:  # 如果物體不在固定夾取區內
-                stable_count = 0  # 把穩定計數歸零
-                last_target = None  # 把上一幀目標清空
-                status_msg = "Place object on cross"  # 提示使用者把物體放回十字中心位置
+def choose_target(targets, center_x, center_y):
+    """
+    從多個候選目標中選出最適合夾取的目標，
+    評分依據為目標與畫面中心的距離（越近越好）並加入面積加分（越大越好）
+    """
+    valid = [t for t in targets if t is not None]  # 過濾掉 None，保留有效目標
+    if not valid:
+        return None  # 若無有效目標則回傳 None
 
-            if in_pick_zone and stable_count >= LOCK_FRAMES and AUTO_RUN:  # 如果目標已穩定進入中心區，且自動模式已開啟
-                cmd = f"PICK:{target['color']}"  # 依照辨識結果組合成 PICK 指令
-                print(f"Detected color: {target['color']}")  # 先在終端機印出目前辨識到的顏色
-                send_cmd(cmd)  # 把顏色夾取命令送給 ESP32
-                pick_start_time = time.time()  # 記錄送出命令的時間
-                state = "WAIT_PICK"  # 切換成等待夾取完成狀態
-                stable_count = 0  # 清空穩定計數，避免重複觸發
-                last_target = None  # 清空上一幀目標，等待下一次任務
-                clear_count = 0  # 清空空白計數，下一階段將重新要求中心區變空
-                status_msg = f"SEND {cmd}"  # 在畫面上顯示已送出哪個命令
+    def score(t):
+        dist       = abs(t["cx"] - center_x) + abs(t["cy"] - center_y)  # 計算目標與中心的曼哈頓距離
+        area_bonus = t["area"] * 0.002                                    # 面積越大給予越高的扣分補償（降低評分值）
+        return dist - area_bonus                                          # 評分值越小代表越優先
 
-    cv2.putText(frame, f"State: {status_msg}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)  # 在畫面左上角顯示目前狀態
-    cv2.putText(frame, f"Color: {color_msg}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)  # 顯示目前辨識到的顏色
-    cv2.putText(frame, f"Zone: {zone_msg}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (0, 255, 0) if zone_msg == "IN" else (0, 0, 255), 2)  # 顯示物體是否在固定夾取區內
-    cv2.putText(frame, f"Stable: {stable_count}/{LOCK_FRAMES}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)  # 顯示目前穩定幀數進度
-    cv2.putText(frame, f"Clear: {clear_count}/{CLEAR_FRAMES_REQUIRED}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)  # 顯示中心區清空確認進度
-    cv2.putText(frame, f"AUTO_RUN: {AUTO_RUN}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 0), 2)  # 顯示自動模式是否啟用
-    cv2.putText(frame, f"LAST CMD: {last_cmd}", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)  # 顯示最後送給 ESP32 的命令
+    return min(valid, key=score)  # 回傳評分最低（最優先）的目標
 
-    cv2.imshow("Fixed Cross Auto Color Pick", frame)  # 顯示處理後的畫面視窗
 
-    key = cv2.waitKey(1) & 0xFF  # 每一圈讀一次鍵盤，並只保留最後 8 位元的鍵值
+def update_stable_count(target):
+    """
+    根據本幀目標與上一幀目標的顏色與位置比較，
+    判斷目標是否持續穩定，並更新穩定幀數計數器
+    """
+    global stable_count, last_target
 
-    if key == ord("q"):  # 如果按下 q
-        break  # 跳出主迴圈並結束程式
-    elif key == ord("s"):  # 如果按下 s
-        AUTO_RUN = not AUTO_RUN  # 切換自動模式開關
-        stable_count = 0  # 切換模式時把穩定幀數清零
-        last_target = None  # 切換模式時把上一幀目標清空
-        clear_count = 0  # 切換模式時把清空幀數也清零
-        if state != "WAIT_PICK":  # 如果當下不是手臂正在動作中
-            state = "SEARCH"  # 讓狀態回到 SEARCH，方便重新開始
-        print("AUTO_RUN =", AUTO_RUN)  # 在終端機印出切換後的狀態
-    elif key == ord("h"):  # 如果按下 h
-        send_cmd("HOME")  # 送出 HOME 命令，讓手臂回原位
-    elif key == ord("o"):  # 如果按下 o
-        send_cmd("OPEN")  # 送出 OPEN 命令，打開夾爪
-    elif key == ord("c"):  # 如果按下 c
-        send_cmd("CLOSE")  # 送出 CLOSE 命令，關閉夾爪
-    elif key == ord("u"):  # 如果按下 u
-        send_cmd("STATUS")  # 送出 STATUS 命令，要求 ESP32 回報目前狀態
-    elif key == ord("r"):  # 如果按下 r
-        send_cmd("PICK:RED")  # 手動測試紅色夾取
-    elif key == ord("g"):  # 如果按下 g
-        send_cmd("PICK:GREEN")  # 手動測試綠色夾取
-    elif key == ord("b"):  # 如果按下 b
-        send_cmd("PICK:BLUE")  # 手動測試藍色夾取
+    if target is None:           # 若本幀無目標則重置所有穩定紀錄
+        stable_count = 0
+        last_target  = None
+        return
 
-cap.release()  # 結束前釋放攝影機資源
-cv2.destroyAllWindows()  # 結束前關閉所有 OpenCV 視窗
+    if last_target is None:      # 若上一幀無目標（剛開始偵測），從 1 開始計數
+        stable_count = 1
+    else:
+        # 判斷顏色是否與上一幀相同
+        same_color   = target["color"] == last_target["color"]
+
+        # 判斷位置偏移是否在允許範圍內（X 與 Y 方向都需符合）
+        close_enough = (
+            abs(target["cx"] - last_target["cx"]) <= TARGET_STABLE_DIST
+            and abs(target["cy"] - last_target["cy"]) <= TARGET_STABLE_DIST
+        )
+
+        if same_color and close_enough:
+            stable_count += 1   # 顏色相同且位置穩定，累加穩定幀數
+        else:
+            stable_count = 1    # 顏色改變或位置跳動，重新從 1 開始計數
+
+    # 更新上一幀目標資訊（只保留判斷所需的欄位）
+    last_target = {
+        "color": target["color"],
+        "cx"   : target["cx"],
+        "cy"   : target["cy"],
+    }
+
+
+def is_target_in_pick_zone(target, center_x, center_y):
+    """
+    判斷目標是否位於畫面中心的固定夾取區矩形範圍內，
+    回傳 True 表示目標在區域內，可進行穩定幀數累積
+    """
+    if target is None:
+        return False  # 無目標直接回傳 False
+
+    error_x = target["cx"] - center_x   # 目標中心與畫面中心的水平偏差
+    error_y = target["cy"] - center_y   # 目標中心與畫面中心的垂直偏差
+
+    # 水平與垂直偏差均在允許範圍內才視為在夾取區
+    return abs(error_x) <= TARGET_ZONE_HALF_W and abs(error_y) <= TARGET_ZONE_HALF_H
+
+
+def reset_search_state():
+    """將狀態機重置回 SEARCH 狀態，並清除所有計數器與上一幀目標紀錄"""
+    global state, stable_count, last_target, clear_count
+    state        = "SEARCH"
+    stable_count = 0
+    last_target  = None
+    clear_count  = 0
+
+
+# =========================================================
+# 攝影機開啟驗證
+# =========================================================
+if not cap.isOpened():
+    print("無法開啟攝影機，請檢查 CAMERA_INDEX。")
+    raise SystemExit  # 若攝影機無法開啟則直接終止程式
+
+
+# =========================================================
+# 主迴圈：每幀執行一次影像處理、狀態判斷與畫面顯示
+# =========================================================
+while True:
+    ret, frame = cap.read()   # 從攝影機讀取一幀畫面，ret 為是否成功的布林值
+    if not ret:
+        print("讀不到攝影機畫面，程式結束。")
+        break  # 若讀取失敗則跳出迴圈，結束程式
+
+    h, w, _ = frame.shape    # 取得畫面的高度（h）與寬度（w）
+    center_x = w // 2        # 計算畫面水平中心座標
+    center_y = h // 2        # 計算畫面垂直中心座標
+
+    # ── 繪製十字準線 ──────────────────────────────────────
+    cv2.line(frame, (center_x, 0), (center_x, h), (255, 255, 255), 1)  # 垂直白色準線
+    cv2.line(frame, (0, center_y), (w, center_y), (255, 255, 255), 1)  # 水平白色準線
+
+    # ── 計算並繪製固定夾取區矩形 ──────────────────────────
+    box_left   = center_x - TARGET_ZONE_HALF_W   # 夾取區左邊界 X
+    box_right  = center_x + TARGET_ZONE_HALF_W   # 夾取區右邊界 X
+    box_top    = center_y - TARGET_ZONE_HALF_H   # 夾取區上邊界 Y
+    box_bottom = center_y + TARGET_ZONE_HALF_H   # 夾取區下邊界 Y
+
+    cv2.rectangle(frame, (box_left, box_top), (box_right, box_bottom), (0, 255, 255), 2)  # 畫黃色矩形框
+    cv2.putText(
+        frame, "FIXED PICK ZONE",
+        (box_left - 10, box_top - 8),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+    )  # 在矩形框上方標示文字說明
+
+    # ── 影像前處理 ────────────────────────────────────────
+    blurred = cv2.GaussianBlur(frame, (11, 11), 0)          # 高斯模糊，降低雜訊與反光干擾
+    hsv     = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)       # 將模糊後的影像從 BGR 轉換為 HSV 色彩空間
+
+    # ── 建立各顏色遮罩 ────────────────────────────────────
+    mask_r = (cv2.inRange(hsv, lower_red1, upper_red1) +
+              cv2.inRange(hsv, lower_red2, upper_red2))   # 合併紅色兩段範圍遮罩（低色相 + 高色相）
+    mask_g = cv2.inRange(hsv, lower_green, upper_green)   # 建立綠色遮罩
+    mask_b = cv2.inRange(hsv, lower_blue,  upper_blue)    # 建立藍色遮罩
+
+    # ── 各顏色目標偵測 ────────────────────────────────────
+    target_r = find_target(mask_r, frame, "RED",   (0,   0, 255))  # 在紅色遮罩中尋找目標，繪製紅色圓圈
+    target_g = find_target(mask_g, frame, "GREEN", (0, 255,   0))  # 在綠色遮罩中尋找目標，繪製綠色圓圈
+    target_b = find_target(mask_b, frame, "BLUE",  (255, 0,   0))  # 在藍色遮罩中尋找目標，繪製藍色圓圈
+
+    # 從三個候選目標中選出最接近中心且面積最大的作為主要目標
+    target = choose_target([target_r, target_g, target_b], center_x, center_y)
+
+    # ── 初始化畫面顯示資訊 ────────────────────────────────
+    status_msg = "SEARCH"   # 狀態訊息，預設為 SEARCH
+    color_msg  = "-"        # 顏色訊息，預設為無目標
+    zone_msg   = "OUT"      # 區域訊息，預設目標不在夾取區
+
+    in_pick_zone = is_target_in_pick_zone(target, center_x, center_y)  # 判斷目標是否在固定夾取區內
+
+    if target is not None:
+        color_msg = target["color"]                       # 更新顏色訊息
+        zone_msg  = "IN" if in_pick_zone else "OUT"       # 更新區域訊息
+
+    # =========================================================
+    # 狀態機邏輯
+    # =========================================================
+
+    # ── 狀態：WAIT_PICK（等待手臂完成夾取動作）──────────────
+    if state == "WAIT_PICK":
+        remain = PICK_WAIT_SECONDS - (time.time() - pick_start_time)  # 計算剩餘等待秒數
+        if remain <= 0:
+            # 等待時間到，轉換至 WAIT_CLEAR 狀態，重置穩定相關計數器
+            state        = "WAIT_CLEAR"
+            clear_count  = 0
+            stable_count = 0
+            last_target  = None
+        else:
+            status_msg = f"WAIT_PICK {remain:.1f}s"  # 顯示剩餘等待時間
+
+    # ── 狀態：WAIT_CLEAR（等待夾取區完全清空）────────────────
+    elif state == "WAIT_CLEAR":
+        if in_pick_zone:
+            clear_count = 0                            # 若夾取區仍有目標，重置清空計數器
+            status_msg  = "WAIT_REMOVE_OBJECT"         # 提示使用者移開物件
+        else:
+            clear_count += 1                           # 夾取區無目標，累加清空幀數
+            status_msg   = f"WAIT_CLEAR {clear_count}/{CLEAR_FRAMES_REQUIRED}"
+            if clear_count >= CLEAR_FRAMES_REQUIRED:
+                # 清空幀數達門檻，確認物件已移離，重置狀態回 SEARCH
+                state        = "SEARCH"
+                clear_count  = 0
+                stable_count = 0
+                last_target  = None
+                status_msg   = "READY_NEXT_OBJECT"
+
+    # ── 狀態：SEARCH（搜尋並鎖定目標）───────────────────────
+    elif state == "SEARCH":
+        if target is None:
+            stable_count = 0       # 無目標時重置穩定計數
+            last_target  = None
+            status_msg   = "SEARCH -> No target"
+        else:
+            if in_pick_zone:
+                update_stable_count(target)                            # 目標在區域內，更新穩定幀數
+                status_msg = f"LOCKING {stable_count}/{LOCK_FRAMES}"  # 顯示鎖定進度
+                cv2.circle(frame, (target["cx"], target["cy"]), 6, (0, 255, 255), -1)  # 在目標中心畫實心點
+            else:
+                stable_count = 0      # 目標不在夾取區，重置穩定計數
+                last_target  = None
+                status_msg   = "Place object on cross"  # 提示使用者將物件移至中心區
+
+        # 若目標在夾取區、穩定幀數達門檻、且自動模式開啟，則送出夾取命令
+        if in_pick_zone and stable_count >= LOCK_FRAMES and AUTO_RUN:
+            cmd = f"PICK:{target['color']}"          # 組合對應顏色的夾取命令字串
+            print(f"Detected color: {target['color']}")
+            send_cmd(cmd)                            # 透過 UDP 送出命令至 ESP32
+            pick_start_time = time.time()            # 記錄命令送出的時間點
+            state        = "WAIT_PICK"               # 切換狀態為等待手臂完成
+            stable_count = 0                         # 重置穩定幀數
+            last_target  = None                      # 清除上一幀目標紀錄
+            clear_count  = 0                         # 重置清空計數器
+            status_msg   = f"SEND {cmd}"             # 更新狀態訊息
+
+    # =========================================================
+    # 畫面資訊顯示（左上角 HUD）
+    # =========================================================
+    cv2.putText(frame, f"ESP32 IP: {ESP_IP}",              (10, 30),  cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255,   0), 2)  # 顯示 ESP32 IP
+    cv2.putText(frame, f"State: {status_msg}",             (10, 60),  cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)  # 顯示目前狀態
+    cv2.putText(frame, f"Color: {color_msg}",              (10, 90),  cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)  # 顯示偵測顏色
+    cv2.putText(frame, f"Zone: {zone_msg}",                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.68,
+                (0, 255, 0) if zone_msg == "IN" else (0, 0, 255), 2)                                                        # 在區域內顯示綠色，否則紅色
+    cv2.putText(frame, f"Stable: {stable_count}/{LOCK_FRAMES}",       (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)  # 顯示穩定幀數進度
+    cv2.putText(frame, f"Clear: {clear_count}/{CLEAR_FRAMES_REQUIRED}",(10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)  # 顯示清空幀數進度
+    cv2.putText(frame, f"AUTO_RUN: {AUTO_RUN}",            (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255,   0), 2)  # 顯示自動模式狀態
+    cv2.putText(frame, f"LAST CMD: {last_cmd}",            (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,  255, 255), 2)  # 顯示最後送出的命令
+
+    cv2.imshow("Fixed Cross Auto Color Pick - Static IP", frame)  # 將處理後的畫面顯示在視窗中
+
+    # =========================================================
+    # 鍵盤控制
+    # =========================================================
+    key = cv2.waitKey(1) & 0xFF  # 等待 1ms 鍵盤輸入，取低 8 位元
+
+    if key == ord("q"):
+        break   # 按 q 離開主迴圈，結束程式
+
+    elif key == ord("s"):
+        AUTO_RUN = not AUTO_RUN   # 切換自動模式開關
+        stable_count = 0
+        last_target  = None
+        clear_count  = 0
+        if state != "WAIT_PICK":   # 若不在等待手臂期間，重置狀態回 SEARCH
+            state = "SEARCH"
+        print("AUTO_RUN =", AUTO_RUN)
+
+    elif key == ord("h"):
+        send_cmd("HOME")    # 送出 HOME 命令，手臂回到初始姿態
+
+    elif key == ord("o"):
+        send_cmd("OPEN")    # 送出 OPEN 命令，夾爪打開
+
+    elif key == ord("c"):
+        send_cmd("CLOSE")   # 送出 CLOSE 命令，夾爪關閉
+
+    elif key == ord("u"):
+        send_cmd("STATUS")  # 送出 STATUS 命令，查詢 ESP32 目前狀態
+
+    elif key == ord("p"):
+        send_cmd("PING")    # 送出 PING 命令，測試 ESP32 是否在線（應回傳 PONG）
+
+    elif key == ord("r"):
+        send_cmd("PICK:RED")    # 手動觸發紅色積木夾取流程
+
+    elif key == ord("g"):
+        send_cmd("PICK:GREEN")  # 手動觸發綠色積木夾取流程
+
+    elif key == ord("b"):
+        send_cmd("PICK:BLUE")   # 手動觸發藍色積木夾取流程
+
+    elif key == ord("1"):
+        send_cmd("M1:90")   # 手動將 M1（底座）伺服馬達移至 90 度
+
+    elif key == ord("2"):
+        send_cmd("M2:90")   # 手動將 M2（主臂）伺服馬達移至 90 度
+
+    elif key == ord("3"):
+        send_cmd("M3:90")   # 手動將 M3（輔臂）伺服馬達移至 90 度
+
+    elif key == ord("4"):
+        send_cmd("M4:110")  # 手動將 M4（夾爪）伺服馬達移至 110 度（半開狀態）
+
+    elif key == ord("z"):
+        send_cmd("BASE:80")   # Base 馬達往左微調至 80 度
+
+    elif key == ord("x"):
+        send_cmd("BASE:100")  # Base 馬達往右微調至 100 度
+
+# =========================================================
+# 程式結束，釋放資源
+# =========================================================
+cap.release()           # 釋放攝影機資源
+cv2.destroyAllWindows() # 關閉所有 OpenCV 視窗
+sock.close()            # 關閉 UDP socket
